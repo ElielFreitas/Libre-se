@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pkl
+!modelo_rotulado_xgb.pkl
+coletados/
+youtube_videos/
+palavras2/
+venv/
+.env
+.DS_Store
+*.tar.gz
+*.zip
+*.rar
