@@ -14,7 +14,7 @@ import mediapipe as mp
 import cv2
 
 from sklearn.preprocessing import LabelEncoder, StandardScaler
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GroupShuffleSplit
 from sklearn.metrics import accuracy_score, classification_report
 import xgboost as xgb
 
@@ -34,6 +34,7 @@ N_COORDS: int = 3
 FEAT_DIM: int = N_LANDMARKS * N_COORDS
 AUG_MULTIPLIER: int = 3
 CONFIDENCE_THRESHOLD: float = 0.8
+MIN_SAMPLES_PER_CLASS: int = 5
 
 random.seed(42)
 np.random.seed(42)
@@ -187,11 +188,11 @@ def augment_sequence(seq: np.ndarray) -> list[np.ndarray]:
         noise_scale = np.random.uniform(0.002, 0.008)
         aug += np.random.normal(0, noise_scale, aug.shape)
 
+        # Escala simula variacao de tamanho da mao; shift removido:
+        # apos normalizar pelo punho, o punho e sempre 0 na inferencia,
+        # entao deslocar tudo criaria uma distribuicao que nunca ocorre.
         scale = np.random.uniform(0.92, 1.08)
         aug *= scale
-
-        shift = np.random.uniform(-0.02, 0.02, D)
-        aug += shift
 
         if np.random.random() < 0.4:
             t_warp = np.random.uniform(0.85, 1.15)
@@ -199,7 +200,7 @@ def augment_sequence(seq: np.ndarray) -> list[np.ndarray]:
             indices = np.linspace(0, T - 1, new_len)
             warped = np.zeros((new_len, D))
             for d in range(D):
-                warped[:, d] = np.interp(indices, np.arange(T), seq[:, d])
+                warped[:, d] = np.interp(indices, np.arange(T), aug[:, d])
             if new_len >= T:
                 aug = warped[:T]
             else:
@@ -278,10 +279,15 @@ def compute_enhanced_features(seq: np.ndarray) -> np.ndarray:
     return np.array(features)
 
 
-def collect_data() -> tuple[np.ndarray, np.ndarray]:
-    """Carrega dados brutos (landmarks) sem augmentacao."""
+def collect_data() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Carrega dados brutos (landmarks) sem augmentacao.
+
+    Retorna tambem o grupo de origem de cada amostra (video ou take),
+    para que segmentos do mesmo video nunca se dividam entre treino e teste.
+    """
     X_raw: list[np.ndarray] = []
     y_raw_labels: list[str] = []
+    groups: list[str] = []
 
     print("\n[1/4] Extraindo landmarks dos videos...")
 
@@ -289,7 +295,9 @@ def collect_data() -> tuple[np.ndarray, np.ndarray]:
         print(f"\n  coletados/:")
         pastas = sorted([p for p in COLETADOS_DIR.iterdir() if p.is_dir()])
         for pasta in pastas:
-            label = pasta.name
+            # normaliza para minusculas: pastas 'A' (webcam) e labels 'a'
+            # (videos) devem ser a mesma classe
+            label = normalize_label(pasta.name)
             npy_files = sorted(pasta.glob("*.npy"))
             for npy_f in npy_files:
                 seq = np.load(npy_f)
@@ -297,6 +305,8 @@ def collect_data() -> tuple[np.ndarray, np.ndarray]:
                     seq = normalize_landmarks(seq)
                     X_raw.append(seq)
                     y_raw_labels.append(label)
+                    m = re.match(r'^minds_(.+)_seg\d+$', npy_f.stem)
+                    groups.append(f"minds_{m.group(1)}" if m else str(npy_f))
             print(f"    {label:15s}: {len(npy_files)} takes")
         total_coletados = sum(len(list(p.glob('*.npy'))) for p in pastas)
         print(f"  >> Total coletados: {total_coletados}")
@@ -319,6 +329,7 @@ def collect_data() -> tuple[np.ndarray, np.ndarray]:
             if seq is not None:
                 X_raw.append(seq)
                 y_raw_labels.append(label)
+                groups.append(str(v))
                 print("OK")
             else:
                 print("SEM MAO")
@@ -339,19 +350,21 @@ def collect_data() -> tuple[np.ndarray, np.ndarray]:
             if seq is not None:
                 X_raw.append(seq)
                 y_raw_labels.append(label)
+                groups.append(str(v))
                 print("OK")
             else:
                 print("SEM MAO")
 
     X_raw_arr = np.array(X_raw)
     y_raw_arr = np.array(y_raw_labels)
+    groups_arr = np.array(groups)
     n_real = len(X_raw_arr)
 
     print(f"\n  Total amostras reais: {n_real}")
     print(f"  Shape: {X_raw_arr.shape}")
     print(f"  Classes: {len(np.unique(y_raw_arr))}")
 
-    return X_raw_arr, y_raw_arr
+    return X_raw_arr, y_raw_arr, groups_arr
 
 
 def build_feature_names() -> list[str]:
@@ -372,38 +385,64 @@ def build_feature_names() -> list[str]:
     return names
 
 
+def grouped_split(indices: np.ndarray, y_enc: np.ndarray, groups: np.ndarray,
+                  test_size: float, seed: int) -> tuple[np.ndarray, np.ndarray]:
+    """Split por grupo: amostras do mesmo video/take nunca se separam.
+
+    Classes que cairiam so no lado menor sao movidas de volta ao treino,
+    garantindo que o modelo conheca todas as classes.
+    """
+    indices = np.asarray(indices)
+    if len(indices) < 4 or len(np.unique(groups[indices])) < 2:
+        return indices, np.array([], dtype=int)
+
+    gss = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
+    tr, te = next(gss.split(indices, y_enc[indices], groups[indices]))
+    train_idx, test_idx = indices[tr], indices[te]
+
+    train_classes = set(y_enc[train_idx].tolist())
+    only_test = np.array([y_enc[i] not in train_classes for i in test_idx])
+    if only_test.any():
+        train_idx = np.concatenate([train_idx, test_idx[only_test]])
+        test_idx = test_idx[~only_test]
+
+    return train_idx, test_idx
+
+
 def main() -> None:
-    X_raw, y_raw_labels = collect_data()
+    X_raw, y_raw_labels, groups = collect_data()
 
     if len(X_raw) == 0:
         print("ERRO: Nenhum dado!")
+        sys.exit(1)
+
+    # Classes com poucas amostras so adicionam ruido e nunca sao
+    # avaliadas de forma confiavel: melhor descartar e coletar mais dados
+    counts = Counter(y_raw_labels.tolist())
+    dropped = sorted(lbl for lbl, n in counts.items() if n < MIN_SAMPLES_PER_CLASS)
+    if dropped:
+        print(f"\n  {len(dropped)} classes com < {MIN_SAMPLES_PER_CLASS} "
+              f"amostras descartadas:")
+        print(f"    {', '.join(dropped)}")
+        keep = np.array([counts[lbl] >= MIN_SAMPLES_PER_CLASS for lbl in y_raw_labels])
+        X_raw = X_raw[keep]
+        y_raw_labels = y_raw_labels[keep]
+        groups = groups[keep]
+
+    if len(X_raw) == 0:
+        print("ERRO: nenhuma classe com amostras suficientes!")
         sys.exit(1)
 
     le = LabelEncoder()
     y_enc = le.fit_transform(y_raw_labels)
     indices = np.arange(len(X_raw))
 
-    # Classes com 1 amostra vao inteiras pro treino
-    class_counts = Counter(y_enc)
-    single_sample = {c for c, n in class_counts.items() if n < 2}
-    multi_sample = [i for i in indices if y_enc[i] not in single_sample]
-    single_idx = [i for i in indices if y_enc[i] in single_sample]
-
-    if multi_sample and len(set(y_enc[multi_sample])) >= 2:
-        train_multi, test_multi = train_test_split(
-            multi_sample, test_size=0.2, random_state=42,
-            stratify=y_enc[multi_sample]
-        )
-        train_idx = np.concatenate([train_multi, single_idx])
-        test_idx = test_multi
-    else:
-        # Tudo vai pro treino, teste usa 20% do total aleatorio
-        train_idx, test_idx = train_test_split(
-            indices, test_size=0.2, random_state=42
-        )
-
-    if single_sample:
-        print(f"\n  {len(single_sample)} classes com 1 amostra - todas no treino")
+    # Teste separado por grupo (sem segmentos do mesmo video nos dois lados)
+    train_idx, test_idx = grouped_split(indices, y_enc, groups,
+                                        test_size=0.2, seed=42)
+    # Validacao para early stopping, tambem por grupo, tirada do treino
+    train_idx, val_idx = grouped_split(train_idx, y_enc, groups,
+                                       test_size=0.15, seed=43)
 
     print(f"\n[2/4] Aumentando dados (x{AUG_MULTIPLIER} no treino)...")
     X_train_list: list[np.ndarray] = []
@@ -427,26 +466,33 @@ def main() -> None:
 
     print(f"\n  Treino apos augmentacao: {len(X_train)} amostras")
 
-    print(f"\n[3/4] Processando teste (sem augmentacao)...")
+    print(f"\n[3/4] Processando validacao e teste (sem augmentacao)...")
+    X_val = np.array([compute_enhanced_features(X_raw[idx]) for idx in val_idx]) \
+        if len(val_idx) else np.empty((0, X_train.shape[1]))
+    y_val = y_enc[val_idx]
+
     X_test_list = [compute_enhanced_features(X_raw[idx]) for idx in test_idx]
-    X_test = np.array(X_test_list)
+    X_test = np.array(X_test_list) if X_test_list else np.empty((0, X_train.shape[1]))
     y_test = y_enc[test_idx]
 
+    print(f"  Validacao: {len(X_val)} amostras")
     print(f"  Teste: {len(X_test)} amostras")
     print(f"  Features: {X_train.shape[1]}")
     print(f"  Classes: {len(np.unique(y_train))}")
-    print(f"  Distribuicao (treino+teste):")
+    print(f"  Distribuicao (treino/val/teste):")
     for cls_name in sorted(le.classes_):
         cls_enc = le.transform([cls_name])[0]
         n_train = (y_train == cls_enc).sum()
+        n_val = (y_val == cls_enc).sum()
         n_test = (y_test == cls_enc).sum()
-        print(f"    {cls_name:15s}: {n_train:3d} treino, {n_test:3d} teste")
+        print(f"    {cls_name:15s}: {n_train:3d} treino, "
+              f"{n_val:3d} val, {n_test:3d} teste")
 
     print(f"\n[4/4] Treinando XGBoost...")
 
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
+    X_test_scaled = scaler.transform(X_test) if len(X_test) else X_test
 
     min_w = max(1, len(y_train) // (len(np.unique(y_train)) * 2))
     sample_weights: np.ndarray = np.ones(len(y_train))
@@ -456,32 +502,45 @@ def main() -> None:
         if n_cls < min_w:
             sample_weights[mask] = min_w / n_cls
 
+    use_early_stopping = len(X_val) > 0
     model = xgb.XGBClassifier(
-        n_estimators=80,
+        n_estimators=300,
         max_depth=4,
-        learning_rate=0.15,
+        learning_rate=0.1,
         subsample=0.8,
         colsample_bytree=0.8,
-        reg_lambda=1.0,
+        reg_lambda=2.0,
         reg_alpha=0.1,
         random_state=42,
         n_jobs=-1,
         eval_metric='mlogloss',
+        early_stopping_rounds=20 if use_early_stopping else None,
     )
-    model.fit(X_train_scaled, y_train, sample_weight=sample_weights, verbose=True)
-
-    y_pred = model.predict(X_test_scaled)
-    acc = accuracy_score(y_test, y_pred)
-    print(f"\n  >>> ACURACIA NO TESTE: {acc*100:.1f}% <<<")
+    if use_early_stopping:
+        X_val_scaled = scaler.transform(X_val)
+        model.fit(X_train_scaled, y_train, sample_weight=sample_weights,
+                  eval_set=[(X_val_scaled, y_val)], verbose=False)
+        print(f"  Early stopping: melhor iteracao = {model.best_iteration}")
+    else:
+        print("  (sem validacao: poucos grupos, treinando sem early stopping)")
+        model.fit(X_train_scaled, y_train, sample_weight=sample_weights,
+                  verbose=False)
 
     y_pred_train = model.predict(X_train_scaled)
-    train_acc = accuracy_score(y_pred_train, y_train)
-    print(f"  >>> ACURACIA NO TREINO: {train_acc*100:.1f}% <<<")
+    train_acc = accuracy_score(y_train, y_pred_train)
+    print(f"\n  >>> ACURACIA NO TREINO: {train_acc*100:.1f}% <<<")
 
-    print(f"\n  Relatorio por classe (teste):")
-    real_labels = le.inverse_transform(np.unique(y_test))
-    print(classification_report(y_test, y_pred, labels=np.unique(y_test),
-                                target_names=real_labels, zero_division=0))
+    if len(X_test):
+        y_pred = model.predict(X_test_scaled)
+        acc = accuracy_score(y_test, y_pred)
+        print(f"  >>> ACURACIA NO TESTE: {acc*100:.1f}% <<<")
+
+        print(f"\n  Relatorio por classe (teste):")
+        real_labels = le.inverse_transform(np.unique(y_test))
+        print(classification_report(y_test, y_pred, labels=np.unique(y_test),
+                                    target_names=real_labels, zero_division=0))
+    else:
+        print("  (sem conjunto de teste: poucos grupos para separar)")
 
     feature_names = build_feature_names()
     importances = model.feature_importances_

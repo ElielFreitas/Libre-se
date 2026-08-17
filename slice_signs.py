@@ -56,7 +56,7 @@ def main() -> None:
             continue
 
         print(f"  Informe os cortes no formato: inicio fim label")
-        print(f"  Ex: 0.5 3.5 azul   (corta de 0.5s a 3.5s, salva como azul_yt.mp4)")
+        print(f"  Ex: 0.5 3.5 azul   (corta de 0.5s a 3.5s, salva como azul_yt_001.mp4)")
         print(f"  Ex: 5.2 8.1 vermelho")
         print(f"  Linha vazia = pular video")
         print(f"  'q' = sair")
@@ -87,12 +87,13 @@ def main() -> None:
                 print(f"    Intervalo invalido (video tem {dur:.1f}s)")
                 continue
 
-            output = PALAVRAS_DIR / f"{label}_yt.mp4"
-            if output.exists():
-                resp = input(f"    {output.name} ja existe. Sobrescrever? (s/N): ")
-                if resp.lower() != 's':
-                    print("    Pulando.")
-                    continue
+            # sufixo numerico: varios clips da mesma classe nao se sobrescrevem
+            n = 1
+            while True:
+                output = PALAVRAS_DIR / f"{label}_yt_{n:03d}.mp4"
+                if not output.exists():
+                    break
+                n += 1
 
             print(f"    Cortando {start:.1f}s -> {end:.1f}s como '{label}'...", end=" ", flush=True)
             if cut_segment(v, output, start, end):

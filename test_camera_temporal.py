@@ -15,7 +15,9 @@ from collections import deque
 
 PROJECT_DIR = Path(__file__).parent
 MODEL_PATH = PROJECT_DIR / "modelo_rotulado_xgb.pkl"
-HAND_MODEL = Path.home() / "hand_landmarker.task"
+HAND_MODEL = PROJECT_DIR / "hand_landmarker.task"
+if not HAND_MODEL.exists():
+    HAND_MODEL = Path.home() / "hand_landmarker.task"
 N_FRAMES: int = 30
 N_LANDMARKS: int = 21
 N_COORDS: int = 3
@@ -142,20 +144,21 @@ def compute_enhanced_features(seq: np.ndarray) -> np.ndarray:
 
 
 print("Inicializando camera...")
-cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
-cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+# API padrao do OpenCV: funciona em Windows, Linux e macOS
+# (CAP_V4L2 e exclusivo do Linux e falhava em outros sistemas)
+cap = None
+for i in range(3):
+    cap = cv2.VideoCapture(i)
+    if cap.isOpened():
+        print(f"Camera encontrada no indice {i}")
+        break
+    cap.release()
+else:
+    print("Nenhuma camera!")
+    sys.exit(1)
+
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-
-if not cap.isOpened():
-    for i in range(3):
-        cap = cv2.VideoCapture(i)
-        if cap.isOpened():
-            print(f"Camera encontrada no indice {i}")
-            break
-    else:
-        print("Nenhuma camera!")
-        sys.exit(1)
 
 window: deque = deque(maxlen=N_FRAMES)
 frame_count: int = 0
