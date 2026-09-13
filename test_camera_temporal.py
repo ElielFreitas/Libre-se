@@ -22,7 +22,8 @@ N_FRAMES: int = 30
 N_LANDMARKS: int = 21
 N_COORDS: int = 3
 FEAT_DIM: int = N_LANDMARKS * N_COORDS
-CONFIDENCE_THRESHOLD: float = 0.8
+CONFIDENCE_THRESHOLD: float = 0.7
+MARGIN_THRESHOLD: float = 0.3
 
 print("=" * 50)
 print("PREDICAO EM TEMPO REAL - MODELO OTIMIZADO")
@@ -213,7 +214,13 @@ while True:
             pred_idx = int(np.argmax(probas))
             conf = float(probas[pred_idx])
 
-            if conf >= CONFIDENCE_THRESHOLD:
+            # Threshold adaptativo: exige que a margem entre a top-1 e a
+            # segunda probabilidade seja grande, evitando falsos positivos
+            # quando o modelo "chuta" uma classe com pouca conviccao.
+            probas_sorted = np.sort(probas)[::-1]
+            margin = probas_sorted[0] - probas_sorted[1]
+
+            if conf >= CONFIDENCE_THRESHOLD and margin >= MARGIN_THRESHOLD:
                 palavra = le.inverse_transform([pred_idx])[0]
                 if palavra == last_pred:
                     pred_count += 1

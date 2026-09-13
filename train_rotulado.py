@@ -546,17 +546,18 @@ def main() -> None:
 
     use_early_stopping = len(X_val) > 0
     model = xgb.XGBClassifier(
-        n_estimators=300,
-        max_depth=4,
-        learning_rate=0.1,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        reg_lambda=2.0,
-        reg_alpha=0.1,
+        n_estimators=200,           # reduzido: menos arvores = menos overfit
+        max_depth=3,                # reduzido de 4: modelos mais rasos generalizam melhor
+        learning_rate=0.08,          # reduzido de 0.1: aprendizado mais gradual
+        subsample=0.75,              # mais aleatoriedade na escolha de amostras
+        colsample_bytree=0.7,       # menos features por arvore
+        reg_lambda=5.0,             # regularizacao L2 forte (default 1.0)
+        reg_alpha=0.5,              # regularizacao L1 (esparsidade)
+        min_child_weight=3,         # folhas precisam de mais amostras
         random_state=42,
         n_jobs=-1,
         eval_metric='mlogloss',
-        early_stopping_rounds=20 if use_early_stopping else None,
+        early_stopping_rounds=30 if use_early_stopping else None,
     )
     if use_early_stopping:
         X_val_scaled = scaler.transform(X_val)
