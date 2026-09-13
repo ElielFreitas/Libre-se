@@ -64,19 +64,44 @@ WORD_GROUPS: dict[str, list[str]] = {
     'porfavor': ['porfavor', 'por_favor'],
 }
 
+# Mapeamento de labels com encoding/index incorreto
+LABEL_FIXES: dict[str, str] = {
+    'com_license': None,      # descartado, classe estranha
+    'nãosei': 'naos_i',
+    'n�osei': 'nao_sei',
+}
+
+
+# Classes consideradas ruido/lixo: nao sao sinais reais de Libras e so
+# adicionam confusao. Sao descartadas durante a normalizacao dos labels.
+DROP_LABELS: set[str] = {
+    'barulho', 'com_license', 'ruim',
+}
+
 
 def normalize_label(label: str) -> str:
     label = label.lower().strip().replace(' ', '_')
+    label = label.replace('\ufffd', '')
+
+    # Corrige encoding quebrado de "nao sei" (acentos perdidos virando \ufffd)
+    if label in ('naosei', 'nosei', 'nao_sei', 'não_sei', 'não_sei', 'nÃ£o_sei'):
+        return 'nao_sei'
+
     for canonical, variants in WORD_GROUPS.items():
         if label in variants:
             return canonical
+
+    if label in DROP_LABELS:
+        return ''
+
     return label
 
 
 def extract_label_palavras2(filename: Path) -> Optional[str]:
     name = filename.stem
     parts = name.split('_', 1)
-    return normalize_label(parts[0])
+    label = normalize_label(parts[0])
+    return label or None
 
 
 def extract_label_youtube(filename: Path) -> Optional[str]:
@@ -112,14 +137,25 @@ def extract_label_youtube(filename: Path) -> Optional[str]:
     }
     for key, label in keywords.items():
         if key in name_lower:
-            return normalize_label(label)
+            return label or None
     return None
 
 
 def normalize_landmarks(seq: np.ndarray) -> np.ndarray:
-    """Converte coordenadas absolutas para posicoes relativas ao punho."""
+    """Converte coordenadas absolutas para posicoes relativas ao punho e a
+    escala da propria mao (independe de posicao, distancia da camera e
+    resolucao). Sem isso, a mesma forma feita perto/longe gera features
+    diferentes e causa falsos positivos (ex: 'a' -> 'familia').
+    """
     r = seq.reshape(-1, N_LANDMARKS, N_COORDS)
     r = r - r[:, 0:1]
+
+    # Escala: distancia punho(0) -> MCP do dedo medio(9). Estabiliza o
+    # tamanho da mao dentro do frame, igualando sinais em qualquer distancia.
+    scale = np.linalg.norm(r[:, 9], axis=1, keepdims=True)
+    scale = np.clip(scale, 1e-6, None)
+    r = r / scale
+
     return r.reshape(-1, FEAT_DIM)
 
 
@@ -298,6 +334,8 @@ def collect_data() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
             # normaliza para minusculas: pastas 'A' (webcam) e labels 'a'
             # (videos) devem ser a mesma classe
             label = normalize_label(pasta.name)
+            if not label:
+                continue
             npy_files = sorted(pasta.glob("*.npy"))
             for npy_f in npy_files:
                 seq = np.load(npy_f)
@@ -499,8 +537,12 @@ def main() -> None:
     for cls in np.unique(y_train):
         mask = y_train == cls
         n_cls = mask.sum()
+        # Reduz peso de classes com muitos dados (MINDS) e aumenta o peso
+        # de classes com poucos (webcam), equilibrando o gradiente do modelo
         if n_cls < min_w:
             sample_weights[mask] = min_w / n_cls
+        elif n_cls > len(X_train) * 0.5:
+            sample_weights[mask] = 0.5
 
     use_early_stopping = len(X_val) > 0
     model = xgb.XGBClassifier(

@@ -54,9 +54,15 @@ landmarker = HandLandmarker.create_from_options(hand_options)
 
 
 def normalize_landmarks(seq: np.ndarray) -> np.ndarray:
-    """Converte coordenadas absolutas para posicoes relativas ao punho."""
+    """Converte coordenadas absolutas para posicoes relativas ao punho e a
+    escala da propria mao (deve espelhar normalize_landmarks do treino)."""
     r = seq.reshape(-1, N_LANDMARKS, N_COORDS)
     r = r - r[:, 0:1]
+
+    scale = np.linalg.norm(r[:, 9], axis=1, keepdims=True)
+    scale = np.clip(scale, 1e-6, None)
+    r = r / scale
+
     return r.reshape(-1, FEAT_DIM)
 
 
