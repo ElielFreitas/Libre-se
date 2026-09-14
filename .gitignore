@@ -3,6 +3,8 @@ __pycache__/
 *.pyo
 *.pkl
 !modelo_rotulado_xgb.pkl
+!modelo_alfabeto.pkl
+*.log
 coletados/
 youtube_videos/
 palavras2/

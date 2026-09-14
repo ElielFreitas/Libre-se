@@ -13,15 +13,14 @@ import pickle
 import numpy as np
 from collections import deque
 
+from libres_features import (N_FRAMES, FEAT_DIM,
+                             normalize_landmarks, compute_enhanced_features)
+
 PROJECT_DIR = Path(__file__).parent
 MODEL_PATH = PROJECT_DIR / "modelo_rotulado_xgb.pkl"
 HAND_MODEL = PROJECT_DIR / "hand_landmarker.task"
 if not HAND_MODEL.exists():
     HAND_MODEL = Path.home() / "hand_landmarker.task"
-N_FRAMES: int = 30
-N_LANDMARKS: int = 21
-N_COORDS: int = 3
-FEAT_DIM: int = N_LANDMARKS * N_COORDS
 CONFIDENCE_THRESHOLD: float = 0.7
 MARGIN_THRESHOLD: float = 0.3
 
@@ -52,102 +51,6 @@ hand_options = HandLandmarkerOptions(
     min_tracking_confidence=0.5,
 )
 landmarker = HandLandmarker.create_from_options(hand_options)
-
-
-def normalize_landmarks(seq: np.ndarray) -> np.ndarray:
-    """Converte coordenadas absolutas para posicoes relativas ao punho e a
-    escala da propria mao (deve espelhar normalize_landmarks do treino)."""
-    r = seq.reshape(-1, N_LANDMARKS, N_COORDS)
-    r = r - r[:, 0:1]
-
-    scale = np.linalg.norm(r[:, 9], axis=1, keepdims=True)
-    scale = np.clip(scale, 1e-6, None)
-    r = r / scale
-
-    return r.reshape(-1, FEAT_DIM)
-
-
-def compute_finger_angles(seq: np.ndarray) -> np.ndarray:
-    """Calcula angulos das articulacoes dos dedos. Retorna (T, 10)."""
-    r = seq.reshape(-1, N_LANDMARKS, N_COORDS)
-
-    triples = [
-        (1, 2, 3), (2, 3, 4),
-        (5, 6, 7), (6, 7, 8),
-        (9, 10, 11), (10, 11, 12),
-        (13, 14, 15), (14, 15, 16),
-        (17, 18, 19), (18, 19, 20),
-    ]
-
-    all_angles = []
-    for a, b, c in triples:
-        v1 = r[:, a] - r[:, b]
-        v2 = r[:, c] - r[:, b]
-        dot = np.sum(v1 * v2, axis=1)
-        norm = np.linalg.norm(v1, axis=1) * np.linalg.norm(v2, axis=1)
-        norm = np.clip(norm, 1e-8, None)
-        cos_ang = np.clip(dot / norm, -1.0, 1.0)
-        all_angles.append(np.arccos(cos_ang))
-
-    return np.column_stack(all_angles)
-
-
-def add_relative_features(seq: np.ndarray) -> np.ndarray:
-    """Distancias relativas entre landmarks."""
-    r = seq.reshape(-1, N_LANDMARKS, N_COORDS)
-    extra = []
-
-    wrist = r[:, 0]
-    for tip in [4, 8, 12, 16, 20]:
-        dist = np.linalg.norm(r[:, tip] - wrist, axis=1)
-        extra.append(dist)
-
-    for a, b in [(4, 8), (8, 12), (12, 16), (16, 20),
-                 (4, 3), (8, 7), (12, 11), (16, 15), (20, 19)]:
-        dist = np.linalg.norm(r[:, a] - r[:, b], axis=1)
-        extra.append(dist)
-
-    return np.column_stack(extra) if extra else np.zeros((seq.shape[0], 1))
-
-
-def compute_enhanced_features(seq: np.ndarray) -> np.ndarray:
-    """Vetor de features: estatisticas temporais + relativas + angulares."""
-    T, D = seq.shape
-    features = []
-
-    for d in range(D):
-        col = seq[:, d]
-        features.extend([
-            np.mean(col), np.std(col), np.min(col), np.max(col),
-            np.max(col) - np.min(col), col[-1] - col[0],
-            np.mean(np.abs(np.diff(col))), np.median(col),
-        ])
-
-    centroids = seq.reshape(T, N_LANDMARKS, N_COORDS).mean(axis=1)
-    for c in range(N_COORDS):
-        traj = centroids[:, c]
-        features.extend([
-            np.mean(traj), np.std(traj), np.max(traj) - np.min(traj),
-            traj[-1] - traj[0], np.mean(np.abs(np.diff(traj))),
-        ])
-
-    rel = add_relative_features(seq)
-    for d in range(rel.shape[1]):
-        col = rel[:, d]
-        features.extend([
-            np.mean(col), np.std(col), np.max(col) - np.min(col),
-            col[-1] - col[0], np.mean(np.abs(np.diff(col))),
-        ])
-
-    angles = compute_finger_angles(seq)
-    for d in range(angles.shape[1]):
-        col = angles[:, d]
-        features.extend([
-            np.mean(col), np.std(col), np.max(col) - np.min(col),
-            col[-1] - col[0], np.mean(np.abs(np.diff(col))),
-        ])
-
-    return np.array(features)
 
 
 print("Inicializando camera...")
